@@ -16,38 +16,26 @@ unique_ptr<ConstantExpression> Transformer::TransformValue(duckdb_libpgquery::PG
 		D_ASSERT(val.val.ival <= NumericLimits<int32_t>::Maximum());
 		return make_uniq<ConstantExpression>(Value::INTEGER((int32_t)val.val.ival));
 	case duckdb_libpgquery::T_PGBitString: {
-		// SQL hex string literal X'...' - convert to BLOB
-		// PostgreSQL parser returns the string as "xDEADBEEF" format
-		const char* hex_str = val.val.str;
-		if (!hex_str) {
-			throw ParserException("Invalid hexadecimal string literal: null string");
+		string bit_string(val.val.str);
+		if (bit_string.empty() || bit_string[0] != 'x') {
+			return make_uniq<ConstantExpression>(Value(string(val.val.str)));
 		}
-
-		// Skip the 'x' or 'X' prefix if present
-		idx_t start_pos = 0;
-		if (hex_str[0] == 'x' || hex_str[0] == 'X') {
-			start_pos = 1;
-		}
-
-		// Validate and convert hex string to binary
-		idx_t hex_len = strlen(hex_str + start_pos);
+		// X'...' hex literal: val.val.str = "xFF..." (lowercase 'x' prefix + hex digits)
+		const char *hex = bit_string.c_str() + 1; // skip 'x' prefix
+		idx_t hex_len = bit_string.size() - 1;
 		if (hex_len % 2 != 0) {
-			throw ParserException("Invalid hexadecimal string literal: odd number of hex digits");
+			throw ParserException("Hex string literal must have an even number of hex digits");
 		}
-
-		idx_t blob_size = hex_len / 2;
-		auto blob_data = make_unsafe_uniq_array_uninitialized<data_t>(blob_size);
-
-		for (idx_t i = 0; i < blob_size; i++) {
-			int high = Blob::HEX_MAP[static_cast<unsigned char>(hex_str[start_pos + i * 2])];
-			int low  = Blob::HEX_MAP[static_cast<unsigned char>(hex_str[start_pos + i * 2 + 1])];
-			if (high < 0 || low < 0) {
-				throw ParserException("Invalid hexadecimal string literal: invalid hex character");
-			}
-			blob_data[i] = static_cast<data_t>((high << 4) | low);
+		// Build \xHH-escaped string that Blob::ToBlob (via Value::BLOB) expects
+		idx_t blob_len = hex_len / 2;
+		string escaped;
+		escaped.reserve(blob_len * 4);
+		for (idx_t i = 0; i < hex_len; i += 2) {
+			escaped += "\\x";
+			escaped += hex[i];
+			escaped += hex[i + 1];
 		}
-
-		return make_uniq<ConstantExpression>(Value::BLOB(const_data_ptr_cast(blob_data.get()), blob_size));
+		return make_uniq<ConstantExpression>(Value::BLOB(escaped));
 	}
 	case duckdb_libpgquery::T_PGString:
 		return make_uniq<ConstantExpression>(Value(string(val.val.str)));

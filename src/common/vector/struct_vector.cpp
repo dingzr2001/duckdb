@@ -3,11 +3,11 @@
 
 namespace duckdb {
 
-VectorStructBuffer::VectorStructBuffer() : VectorBuffer(VectorBufferType::STRUCT_BUFFER) {
+VectorStructBuffer::VectorStructBuffer() : VectorBuffer(VectorType::FLAT_VECTOR, VectorBufferType::STRUCT_BUFFER) {
 }
 
 VectorStructBuffer::VectorStructBuffer(const LogicalType &type, idx_t capacity)
-    : VectorBuffer(VectorBufferType::STRUCT_BUFFER) {
+    : VectorBuffer(VectorType::FLAT_VECTOR, VectorBufferType::STRUCT_BUFFER) {
 	auto &child_types = StructType::GetChildTypes(type);
 	for (auto &child_type : child_types) {
 		children.emplace_back(child_type.second, capacity);
@@ -16,12 +16,24 @@ VectorStructBuffer::VectorStructBuffer(const LogicalType &type, idx_t capacity)
 }
 
 VectorStructBuffer::VectorStructBuffer(Vector &other, const SelectionVector &sel, idx_t count)
-    : VectorBuffer(VectorBufferType::STRUCT_BUFFER) {
+    : VectorBuffer(VectorType::FLAT_VECTOR, VectorBufferType::STRUCT_BUFFER) {
 	auto &other_vector = StructVector::GetEntries(other);
 	for (auto &child_vector : other_vector) {
 		children.emplace_back(child_vector, sel, count);
 	}
-	validity = other.GetBuffer()->Cast<VectorStructBuffer>().validity;
+	// slice the validity mask of the original struct
+	auto &original_validity = other.GetBuffer()->GetValidityMask();
+	if (count > STANDARD_VECTOR_SIZE) {
+		validity.Resize(count);
+	}
+	validity.CopySel(original_validity, sel, 0, 0, count);
+}
+
+void VectorStructBuffer::SetVectorType(VectorType new_vector_type) {
+	vector_type = new_vector_type;
+	for (auto &child : children) {
+		child.SetVectorType(new_vector_type);
+	}
 }
 
 VectorStructBuffer::~VectorStructBuffer() {
@@ -33,8 +45,7 @@ vector<Vector> &StructVector::GetEntries(Vector &vector) {
 	         vector.GetType().id() == LogicalTypeId::AGGREGATE_STATE);
 
 	if (vector.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
-		auto &child = DictionaryVector::Child(vector);
-		return StructVector::GetEntries(child);
+		throw InternalException("Struct vectors cannot be dictionary vectors");
 	}
 	D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR ||
 	         vector.GetVectorType() == VectorType::CONSTANT_VECTOR);
