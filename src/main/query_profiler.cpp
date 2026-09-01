@@ -927,7 +927,9 @@ unique_ptr<QueryProfileResult> QueryProfiler::ToLegacyResultTree() const {
 
 	emit("total_memory_allocated", "system.total_memory_allocated");
 	emit("total_bytes_written", "io.total_bytes_written");
+	emit("total_write_operations", "io.total_write_operations");
 	emit("total_bytes_read", "io.total_bytes_read");
+	emit("total_read_operations", "io.total_read_operations");
 	emit("system_peak_temp_dir_size", "system.peak_temp_dir_size");
 	emit("system_peak_buffer_memory", "system.peak_buffer_memory");
 
