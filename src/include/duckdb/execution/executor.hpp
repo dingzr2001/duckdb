@@ -55,6 +55,11 @@ public:
 	void Initialize(unique_ptr<PhysicalOperator> physical_plan);
 
 	void CancelTasks();
+	//! Whether the thread driving ExecuteTask holds a partially processed task.
+	//! `task` is owned by that thread alone, so only it may call this.
+	bool HasTaskInProgress() const {
+		return task != nullptr;
+	}
 	PendingExecutionResult ExecuteTask(bool dry_run = false);
 	void WaitForTask();
 	void SignalTaskRescheduled(lock_guard<mutex> &);
