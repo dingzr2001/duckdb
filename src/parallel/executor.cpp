@@ -376,9 +376,13 @@ void Executor::WaitForTask() {
 		blocked_thread_time += blocked_micros;
 		return;
 	}
-	auto &scheduler = TaskScheduler::GetScheduler(context);
-	if (scheduler.GetTaskCountForProducer(*producer) > 0) {
-		// A task is available for the calling thread, the next step will make progress without waiting
+	if (task) {
+		// This thread is holding a partially processed task, the next step will make progress without waiting
+		blocked_thread_time += blocked_micros;
+		return;
+	}
+	if (TaskScheduler::GetScheduler(context).GetTaskCountForProducer(*producer) > 0) {
+		// A new task is available for the calling thread, the next step will make progress without waiting
 		blocked_thread_time += blocked_micros;
 		return;
 	}
