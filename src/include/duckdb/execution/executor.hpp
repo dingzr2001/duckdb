@@ -187,7 +187,7 @@ private:
 	//! Currently alive executor tasks
 	atomic<idx_t> executor_tasks;
 
-	//! Total time blocked while waiting on tasks. In ticks. One tick corresponds to WAIT_TIME.
+	//! Total time blocked while waiting on tasks, in microseconds
 	atomic<idx_t> blocked_thread_time;
 };
 } // namespace duckdb

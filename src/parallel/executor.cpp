@@ -388,8 +388,10 @@ void Executor::WaitForTask() {
 	}
 	// Nothing to run on this thread, all remaining tasks are either running on other threads or descheduled.
 	// Wait (bounded), but wake up on task completion or reschedule.
-	blocked_thread_time += blocked_micros + WAIT_TIME_MS.count();
+	const auto wait_begin = TimePoint::Tick();
 	task_reschedule.wait_for(l, WAIT_TIME_MS);
+	const auto wait_micros = NumericCast<idx_t>(TimePoint::ElapsedMicros(wait_begin, TimePoint::Tick()));
+	blocked_thread_time += blocked_micros + wait_micros;
 #endif
 }
 
