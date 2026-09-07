@@ -32,14 +32,9 @@ enum class MockResponseMode : uint8_t {
 struct HTTPTransportManagerTestHelper {
 	static unique_ptr<HTTPTransportManager> Create(const shared_ptr<HTTPUtil> &provider, idx_t capacity) {
 		auto result = HTTPTransportManager::Create(provider);
-		HTTPTransportManager::ClientBucketMap client_buckets;
-		client_buckets.reserve(capacity);
-		vector<optional_ptr<HTTPTransportManager::ClientBucket>> non_empty_buckets;
-		non_empty_buckets.reserve(capacity);
+		HTTPClientPool clients(capacity);
 		annotated_lock_guard<annotated_mutex> guard(result->lock);
-		result->capacity = capacity;
-		result->client_buckets = std::move(client_buckets);
-		result->non_empty_buckets = std::move(non_empty_buckets);
+		result->clients = std::move(clients);
 		result->initialized = true;
 		return result;
 	}
@@ -54,21 +49,22 @@ struct HTTPTransportManagerTestHelper {
 
 	static idx_t OccupiedSlots(HTTPTransportManager &manager) {
 		annotated_lock_guard<annotated_mutex> guard(manager.lock);
-		return manager.reserved_clients;
+		return manager.clients.ReservedClients();
 	}
 
 	static idx_t IdleClients(HTTPTransportManager &manager) {
 		annotated_lock_guard<annotated_mutex> guard(manager.lock);
-		idx_t result = 0;
-		for (auto &entry : manager.client_buckets) {
-			result += entry.second.idle_clients.size();
-		}
-		return result;
+		return manager.clients.IdleClients();
 	}
 
 	static idx_t IdleKeys(HTTPTransportManager &manager) {
 		annotated_lock_guard<annotated_mutex> guard(manager.lock);
-		return manager.client_buckets.size();
+		return manager.clients.BucketCount();
+	}
+
+	static idx_t AdmissionWaiters(HTTPTransportManager &manager) {
+		annotated_lock_guard<annotated_mutex> guard(manager.lock);
+		return manager.clients.AdmissionWaiters();
 	}
 
 	static void Close(HTTPTransportManager &manager) {
@@ -122,6 +118,7 @@ struct MockTransportState {
 	std::atomic<idx_t> requests_started {0};
 	idx_t requests_allowed = NumericLimits<idx_t>::Maximum();
 	vector<idx_t> request_client_ids;
+	vector<string> request_urls;
 };
 
 static void UpdateHighWater(MockTransportState &state, idx_t live) {
@@ -204,6 +201,7 @@ public:
 			unique_lock<mutex> guard(state->request_lock);
 			auto request_index = state->requests_started++;
 			state->request_client_ids.push_back(client_id);
+			state->request_urls.push_back(info.url);
 			state->request_cv.notify_all();
 			state->request_cv.wait(guard, [&]() { return request_index < state->requests_allowed; });
 		}
@@ -258,6 +256,17 @@ private:
 	idx_t client_id;
 };
 
+class MockHTTPParams : public HTTPParams {
+public:
+	explicit MockHTTPParams(HTTPUtil &http_util) : HTTPParams(http_util) {
+	}
+
+public:
+	void SetReuseDomain(idx_t reuse_domain) {
+		SetTransportReuseDomain(reuse_domain);
+	}
+};
+
 class MockHTTPUtil : public HTTPUtil {
 public:
 	MockHTTPUtil(HTTPTransportReusePolicy policy_p, string name_p = "mock")
@@ -279,7 +288,7 @@ public:
 		}
 		state->initialized_paths.push_back(info ? info->file_path : string());
 		state->initialized_with_context.push_back(bool(FileOpener::TryGetClientContext(opener)));
-		auto result = make_uniq<HTTPParams>(*this);
+		auto result = make_uniq<MockHTTPParams>(*this);
 		result->Initialize(opener);
 		result->retries = state->retries;
 		return result;
@@ -358,6 +367,53 @@ TEST_CASE("HTTP transport manager capacity and provider contracts", "[http_trans
 		CHECK(HTTPTransportManagerTestHelper::AdvanceConnectionEpoch(connection_epoch, reuse_poisoned));
 	}
 
+	SECTION("pool coalesces prepared buckets and separates colliding origins") {
+		HTTPClientPool pool(2);
+		HTTPClientPool::ClientKey key;
+		key.provider_epoch = 0;
+		key.origin_hash = 42;
+		const string first_origin = "https://first.example.com";
+		const string second_origin = "https://second.example.com";
+		auto state = make_shared_ptr<MockTransportState>();
+
+		auto first = pool.Reserve(key, first_origin, true);
+		auto second = pool.Reserve(key, first_origin, true);
+		REQUIRE(first.PrepareBucket(first_origin));
+		REQUIRE(second.PrepareBucket(first_origin));
+		pool.AdoptPreparedBucket(first, first_origin);
+		pool.AdoptPreparedBucket(second, first_origin);
+		CHECK(pool.BucketCount() == 1);
+		CHECK(pool.ReservedClients() == 2);
+		CHECK_FALSE(pool.HasAdmissionResource());
+		pool.Return(first.bucket, make_uniq<MockHTTPClient>(state, first_origin));
+		CHECK(pool.HasAdmissionResource());
+
+		// The same hash must evict, rather than reuse, a different origin's idle client.
+		auto collision = pool.Reserve(key, second_origin, true);
+		CHECK(collision.kind == HTTPClientPool::ReservationKind::NEW_CLIENT);
+		REQUIRE(collision.client);
+		CHECK(collision.client->GetBaseUrl() == first_origin);
+		collision.client.reset();
+		CHECK(pool.ReservedClients() == 2);
+		REQUIRE(collision.PrepareBucket(second_origin));
+		pool.AdoptPreparedBucket(collision, second_origin);
+		CHECK(pool.BucketCount() == 2);
+		pool.Return(collision.bucket, make_uniq<MockHTTPClient>(state, second_origin));
+		auto removed_first = pool.FinishDestruction(second.bucket);
+		CHECK(pool.ReservedClients() == 1);
+		CHECK(pool.BucketCount() == 1);
+
+		auto reused = pool.Reserve(key, second_origin, true);
+		CHECK(reused.kind == HTTPClientPool::ReservationKind::REUSE);
+		REQUIRE(reused.client);
+		CHECK(reused.client->GetBaseUrl() == second_origin);
+		reused.client.reset();
+		CHECK(pool.ReservedClients() == 1);
+		auto removed_second = pool.FinishDestruction(reused.bucket);
+		CHECK(pool.IsEmpty());
+		CHECK(state->live == 0);
+	}
+
 	SECTION("default provider contracts preserve direct callers") {
 		HTTPUtil provider;
 		CHECK(provider.GetTransportReusePolicy() == HTTPTransportReusePolicy::EPHEMERAL);
@@ -427,6 +483,17 @@ static void AllowMockRequests(MockTransportState &state, idx_t count) {
 	state.request_cv.notify_all();
 }
 
+static bool WaitForAdmissionWaiters(HTTPTransportManager &manager, idx_t count) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (HTTPTransportManagerTestHelper::AdmissionWaiters(manager) == count) {
+			return true;
+		}
+		std::this_thread::yield();
+	}
+	return false;
+}
+
 TEST_CASE("HTTP transport manager synchronous session API", "[http_transport_manager]") {
 	SECTION("reuse policies have distinct capacity and lifetime behavior") {
 		for (auto policy : {HTTPTransportReusePolicy::CLIENT_FREE, HTTPTransportReusePolicy::EPHEMERAL,
@@ -465,6 +532,25 @@ TEST_CASE("HTTP transport manager synchronous session API", "[http_transport_man
 		CHECK(provider->state->live == 0);
 		REQUIRE(RunManagedRequest(session, *clone, "https://example.com/"));
 		CHECK(provider->state->created == 2);
+	}
+
+	SECTION("transport reuse domains separate otherwise identical clients") {
+		auto provider = make_shared_ptr<MockHTTPUtil>(HTTPTransportReusePolicy::SHARED);
+		auto manager = HTTPTransportManagerTestHelper::Create(provider, 1);
+		auto session = manager->CreateSession(nullptr, nullptr);
+		auto &params = session.Parameters().Cast<MockHTTPParams>();
+		params.SetReuseDomain(42);
+		auto clone = make_uniq<HTTPParams>(params);
+		CHECK(clone->GetTransportReuseDomain() == 42);
+
+		REQUIRE(RunManagedRequest(session, params, "https://example.com/"));
+		REQUIRE(RunManagedRequest(session, *clone, "https://example.com/"));
+		CHECK(provider->state->created == 1);
+
+		params.SetReuseDomain(43);
+		REQUIRE(RunManagedRequest(session, params, "https://example.com/"));
+		CHECK(provider->state->created == 2);
+		CHECK(provider->state->high_water == 1);
 	}
 
 	SECTION("generic failure discards only its client") {
@@ -510,6 +596,89 @@ TEST_CASE("HTTP transport manager synchronous session API", "[http_transport_man
 		CHECK(provider->state->created == 1);
 		CHECK(provider->state->high_water == 1);
 		CHECK(HTTPTransportManagerTestHelper::OccupiedSlots(*manager) == 1);
+	}
+
+	SECTION("FIFO admission prevents a later exact-key request from barging") {
+		auto provider = make_shared_ptr<MockHTTPUtil>(HTTPTransportReusePolicy::SHARED);
+		auto manager = HTTPTransportManagerTestHelper::Create(provider, 1);
+		auto busy_session = manager->CreateSession(nullptr, nullptr);
+		auto waiting_session = manager->CreateSession(nullptr, nullptr);
+		auto busy_params = make_uniq<HTTPParams>(busy_session.Parameters());
+		BlockMockRequests(*provider->state);
+
+		auto holder = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(busy_session, busy_session.Parameters(), "https://busy.example.com/holder");
+		});
+		REQUIRE(WaitForMockRequests(*provider->state, 1));
+
+		auto first_waiter = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(waiting_session, waiting_session.Parameters(), "https://waiting.example.com/");
+		});
+		REQUIRE(WaitForAdmissionWaiters(*manager, 1));
+
+		auto later_exact_request = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(busy_session, *busy_params, "https://busy.example.com/later");
+		});
+		REQUIRE(WaitForAdmissionWaiters(*manager, 2));
+
+		AllowMockRequests(*provider->state, 1);
+		REQUIRE(holder.get());
+		REQUIRE(WaitForMockRequests(*provider->state, 2));
+		{
+			lock_guard<mutex> guard(provider->state->request_lock);
+			REQUIRE(provider->state->request_urls.size() == 2);
+			CHECK(provider->state->request_urls[1] == "https://waiting.example.com/");
+		}
+
+		AllowMockRequests(*provider->state, 2);
+		REQUIRE(first_waiter.get());
+		REQUIRE(WaitForMockRequests(*provider->state, 3));
+		{
+			lock_guard<mutex> guard(provider->state->request_lock);
+			REQUIRE(provider->state->request_urls.size() == 3);
+			CHECK(provider->state->request_urls[2] == "https://busy.example.com/later");
+		}
+		AllowMockRequests(*provider->state, 3);
+		REQUIRE(later_exact_request.get());
+		CHECK(provider->state->high_water == 1);
+	}
+
+	SECTION("FIFO admission hands off after client creation fails") {
+		auto provider = make_shared_ptr<MockHTTPUtil>(HTTPTransportReusePolicy::SHARED);
+		auto manager = HTTPTransportManagerTestHelper::Create(provider, 1);
+		auto holding_session = manager->CreateSession(nullptr, nullptr);
+		auto failing_session = manager->CreateSession(nullptr, nullptr);
+		auto succeeding_session = manager->CreateSession(nullptr, nullptr);
+		BlockMockRequests(*provider->state);
+
+		auto holder = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(holding_session, holding_session.Parameters(), "https://holder.example.com/");
+		});
+		REQUIRE(WaitForMockRequests(*provider->state, 1));
+		auto failing_waiter = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(failing_session, failing_session.Parameters(), "https://failing.example.com/");
+		});
+		REQUIRE(WaitForAdmissionWaiters(*manager, 1));
+		auto succeeding_waiter = std::async(std::launch::async, [&]() {
+			return RunManagedRequest(succeeding_session, succeeding_session.Parameters(),
+			                         "https://succeeding.example.com/");
+		});
+		REQUIRE(WaitForAdmissionWaiters(*manager, 2));
+
+		provider->state->creation_failures = 1;
+		AllowMockRequests(*provider->state, 1);
+		REQUIRE(holder.get());
+		CHECK_THROWS_AS(failing_waiter.get(), IOException);
+		REQUIRE(WaitForMockRequests(*provider->state, 2));
+		{
+			lock_guard<mutex> guard(provider->state->request_lock);
+			REQUIRE(provider->state->request_urls.size() == 2);
+			CHECK(provider->state->request_urls[1] == "https://succeeding.example.com/");
+		}
+		AllowMockRequests(*provider->state, 2);
+		REQUIRE(succeeding_waiter.get());
+		CHECK(HTTPTransportManagerTestHelper::AdmissionWaiters(*manager) == 0);
+		CHECK(provider->state->high_water == 1);
 	}
 
 	SECTION("exact keys reuse clients and local sessions remain separate") {
@@ -720,20 +889,24 @@ TEST_CASE("HTTP transport manager synchronous session API", "[http_transport_man
 		auto manager = HTTPTransportManagerTestHelper::Create(provider, 1);
 		auto session = manager->CreateSession(nullptr, nullptr);
 		auto second_params = make_uniq<HTTPParams>(session.Parameters());
+		auto third_params = make_uniq<HTTPParams>(session.Parameters());
 		BlockMockRequests(*provider->state);
 		auto first = std::async(std::launch::async, [&]() {
 			return RunManagedRequest(session, session.Parameters(), "https://example.com/");
 		});
 		REQUIRE(WaitForMockRequests(*provider->state, 1));
-		std::promise<void> waiter_started;
-		auto waiter = std::async(std::launch::async, [&]() {
-			waiter_started.set_value();
-			return RunManagedRequest(session, *second_params, "https://example.com/");
-		});
-		waiter_started.get_future().wait();
-		CHECK(waiter.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+		auto first_waiter = std::async(
+		    std::launch::async, [&]() { return RunManagedRequest(session, *second_params, "https://example.com/"); });
+		REQUIRE(WaitForAdmissionWaiters(*manager, 1));
+		auto second_waiter = std::async(
+		    std::launch::async, [&]() { return RunManagedRequest(session, *third_params, "https://example.com/"); });
+		REQUIRE(WaitForAdmissionWaiters(*manager, 2));
 		HTTPTransportManagerTestHelper::Close(*manager);
-		CHECK_THROWS_AS(waiter.get(), InvalidInputException);
+		CHECK_THROWS_AS(manager->CreateSession(nullptr, nullptr), InvalidInputException);
+		CHECK_THROWS_AS(HTTPTransportManagerTestHelper::SetHTTPUtil(*manager, provider), InvalidInputException);
+		CHECK_THROWS_AS(first_waiter.get(), InvalidInputException);
+		CHECK_THROWS_AS(second_waiter.get(), InvalidInputException);
+		CHECK(HTTPTransportManagerTestHelper::AdmissionWaiters(*manager) == 0);
 		AllowMockRequests(*provider->state, 1);
 		REQUIRE(first.get());
 		CHECK(provider->state->live == 0);

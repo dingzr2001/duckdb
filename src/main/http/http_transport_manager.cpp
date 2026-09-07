@@ -154,24 +154,8 @@ void HTTPTransportManager::Session::Invalidate() noexcept {
 	}
 }
 
-bool HTTPTransportManager::ClientKey::operator==(const ClientKey &other) const {
-	return provider_epoch == other.provider_epoch && connection_epoch == other.connection_epoch &&
-	       session_id == other.session_id && origin_hash == other.origin_hash;
-}
-
-hash_t HTTPTransportManager::ClientKeyHash::operator()(const ClientKey &key) const {
-	auto result = std::hash<idx_t> {}(key.provider_epoch);
-	auto combine = [&](hash_t value) {
-		result ^= value + 0x9e3779b9U + (result << 6U) + (result >> 2U);
-	};
-	combine(std::hash<uint64_t> {}(key.connection_epoch));
-	combine(std::hash<idx_t> {}(key.session_id));
-	combine(key.origin_hash);
-	return result;
-}
-
 HTTPTransportManager::Lease::Lease(HTTPTransportManager &manager_p, HTTPTransportManagerState &state_p,
-                                   optional_ptr<ClientBucket> bucket_p, unique_ptr<HTTPClient> client_p)
+                                   BucketHandle bucket_p, unique_ptr<HTTPClient> client_p)
     : manager(manager_p), state(state_p), bucket(bucket_p), client(std::move(client_p)) {
 }
 
@@ -180,7 +164,7 @@ HTTPTransportManager::Lease::Lease(Lease &&other) noexcept
       reusable(other.reusable) {
 	other.manager = nullptr;
 	other.state = nullptr;
-	other.bucket = nullptr;
+	other.bucket = BucketHandle();
 	other.reusable = false;
 }
 
@@ -194,7 +178,7 @@ void HTTPTransportManager::Lease::Reset() noexcept {
 	}
 	manager = nullptr;
 	state = nullptr;
-	bucket = nullptr;
+	bucket = BucketHandle();
 	client.reset();
 	reusable = false;
 }
@@ -226,9 +210,7 @@ HTTPTransportManager::HTTPTransportManager(const shared_ptr<HTTPUtil> &initial_h
 HTTPTransportManager::~HTTPTransportManager() {
 	Close();
 	annotated_lock_guard<annotated_mutex> guard(lock);
-	D_ASSERT(reserved_clients == 0);
-	D_ASSERT(client_buckets.empty());
-	D_ASSERT(non_empty_buckets.empty());
+	D_ASSERT(clients.IsEmpty());
 }
 
 idx_t HTTPTransportManager::CalculateCapacity(idx_t system_concurrency, optional_idx file_descriptor_limit) {
@@ -275,18 +257,16 @@ bool HTTPTransportManager::AdvanceConnectionEpoch(uint64_t &connection_epoch, bo
 
 void HTTPTransportManager::Initialize(idx_t system_concurrency) {
 	auto new_capacity = CalculateCapacity(system_concurrency, GetFileDescriptorLimit());
-	ClientBucketMap new_client_buckets;
-	new_client_buckets.reserve(new_capacity);
-	vector<optional_ptr<ClientBucket>> new_non_empty_buckets;
-	new_non_empty_buckets.reserve(new_capacity);
+	HTTPClientPool new_clients(new_capacity);
 
 	annotated_lock_guard<annotated_mutex> guard(lock);
 	if (initialized) {
 		throw InternalException("HTTP transport manager was initialized more than once");
 	}
-	capacity = new_capacity;
-	client_buckets = std::move(new_client_buckets);
-	non_empty_buckets = std::move(new_non_empty_buckets);
+	if (clients.IsClosed()) {
+		throw InvalidInputException("HTTP transport manager is closed");
+	}
+	clients = std::move(new_clients);
 	initialized = true;
 }
 
@@ -295,7 +275,7 @@ HTTPTransportManager::SessionReservation HTTPTransportManager::ReserveSession() 
 	if (!initialized) {
 		throw InternalException("HTTP transport manager is not initialized");
 	}
-	if (closed) {
+	if (clients.IsClosed()) {
 		throw InvalidInputException("HTTP transport manager is closed");
 	}
 	if (next_session_id == DConstants::INVALID_INDEX) {
@@ -359,7 +339,7 @@ void HTTPTransportManager::SetHTTPUtil(const shared_ptr<HTTPUtil> &new_http_util
 	idx_t old_provider_epoch;
 	{
 		annotated_lock_guard<annotated_mutex> guard(lock);
-		if (closed) {
+		if (clients.IsClosed()) {
 			throw InvalidInputException("HTTP transport manager is closed");
 		}
 		if (providers.size() == DConstants::INVALID_INDEX) {
@@ -383,7 +363,7 @@ bool HTTPTransportManager::IsStateValidLocked(const HTTPTransportManagerState &s
 }
 
 void HTTPTransportManager::ValidateStateLocked(const HTTPTransportManagerState &state) const {
-	if (closed) {
+	if (clients.IsClosed()) {
 		throw InvalidInputException("HTTP transport manager is closed");
 	}
 	if (!IsStateValidLocked(state)) {
@@ -391,170 +371,26 @@ void HTTPTransportManager::ValidateStateLocked(const HTTPTransportManagerState &
 	}
 }
 
-HTTPTransportManager::ClientBucketMap::iterator HTTPTransportManager::FindBucketLocked(const ClientKey &key,
-                                                                                       const string &origin) {
-	auto entry = client_buckets.find(key);
-	if (entry == client_buckets.end() || entry->second.origin == origin) {
-		return entry;
-	}
-	auto range = client_buckets.equal_range(key);
-	for (entry = range.first; entry != range.second; ++entry) {
-		if (entry->second.origin == origin) {
-			return entry;
-		}
-	}
-	return client_buckets.end();
-}
-
-void HTTPTransportManager::AddNonEmptyBucketLocked(ClientBucket &bucket) {
-	D_ASSERT(!bucket.idle_clients.empty());
-	D_ASSERT(!bucket.non_empty_index.IsValid());
-	D_ASSERT(non_empty_buckets.size() < capacity);
-	bucket.non_empty_index = non_empty_buckets.size();
-	non_empty_buckets.push_back(bucket);
-}
-
-void HTTPTransportManager::RemoveNonEmptyBucketLocked(ClientBucket &bucket) {
-	D_ASSERT(bucket.non_empty_index.IsValid());
-	auto index = bucket.non_empty_index.GetIndex();
-	D_ASSERT(index < non_empty_buckets.size());
-	auto last_bucket = non_empty_buckets.back();
-	non_empty_buckets[index] = last_bucket;
-	last_bucket->non_empty_index = index;
-	non_empty_buckets.pop_back();
-	bucket.non_empty_index.SetInvalid();
-}
-
-unique_ptr<HTTPClient> HTTPTransportManager::TakeIdleClientLocked(ClientBucket &bucket) {
-	D_ASSERT(!bucket.idle_clients.empty());
-	auto result = std::move(bucket.idle_clients.back());
-	bucket.idle_clients.pop_back();
-	if (bucket.idle_clients.empty()) {
-		RemoveNonEmptyBucketLocked(bucket);
-	}
-	return result;
-}
-
-HTTPTransportManager::ClientBucketMap::node_type HTTPTransportManager::ExtractBucketLocked(ClientBucket &bucket) {
-	D_ASSERT(bucket.reserved_clients == 0);
-	D_ASSERT(bucket.idle_clients.empty());
-	D_ASSERT(!bucket.non_empty_index.IsValid());
-	auto entry = FindBucketLocked(bucket.key, bucket.origin);
-	D_ASSERT(entry != client_buckets.end());
-	D_ASSERT(&entry->second == &bucket);
-	return client_buckets.extract(entry);
-}
-
-void HTTPTransportManager::WaitForAdmissionLocked(annotated_unique_lock<annotated_mutex> &guard) {
-	if (HTTPTransportCapacityGuard::CurrentThreadOwnsCapacity(*this)) {
-		throw InvalidInputException("Nested HTTP client acquisition would wait for manager capacity");
-	}
-	waiting_threads++;
-	try {
-		availability.wait(guard, [&]() DUCKDB_REQUIRES(lock) {
-			return closed || reserved_clients < capacity || !non_empty_buckets.empty();
-		});
-	} catch (...) {
-		waiting_threads--;
-		throw;
-	}
-	waiting_threads--;
-}
-
 HTTPTransportManager::Reservation
 HTTPTransportManager::ReserveClientLocked(HTTPTransportManagerState &state, ClientKey key, const string &origin,
                                           annotated_unique_lock<annotated_mutex> &guard) {
 	D_ASSERT(state.reuse_policy != HTTPTransportReusePolicy::CLIENT_FREE);
-	while (true) {
-		ValidateStateLocked(state);
+	ValidateStateLocked(state);
+	clients.WaitForAdmission(guard, HTTPTransportCapacityGuard::CurrentThreadOwnsCapacity(*this));
+	ValidateStateLocked(state);
 
-		key.connection_epoch = state.connection_epoch;
-		const bool cacheable = state.provider_epoch == current_provider_epoch && !state.reuse_poisoned &&
-		                       (state.reuse_policy == HTTPTransportReusePolicy::SESSION_LOCAL ||
-		                        state.reuse_policy == HTTPTransportReusePolicy::SHARED);
-		auto exact = cacheable ? FindBucketLocked(key, origin) : client_buckets.end();
-		if (exact != client_buckets.end() && !exact->second.idle_clients.empty()) {
-			Reservation result;
-			result.key = key;
-			result.cacheable = true;
-			result.bucket = exact->second;
-			result.client = TakeIdleClientLocked(exact->second);
-			result.kind = ReservationKind::REUSE;
-			HTTPTransportCapacityGuard::MarkCurrentCapacityOwned(*this);
-			return result;
-		}
-
-		D_ASSERT(reserved_clients <= capacity);
-		if (reserved_clients == capacity && non_empty_buckets.empty()) {
-			WaitForAdmissionLocked(guard);
-			continue;
-		}
-
-		Reservation result;
-		result.key = key;
-		result.cacheable = cacheable;
-		result.kind = ReservationKind::NEW_CLIENT;
-		result.bucket_capacity = capacity;
-		if (reserved_clients < capacity) {
-			reserved_clients++;
-		} else {
-			D_ASSERT(!non_empty_buckets.empty());
-			auto replacement_bucket = non_empty_buckets.back();
-			result.client = TakeIdleClientLocked(*replacement_bucket);
-			D_ASSERT(replacement_bucket->reserved_clients > 0);
-			replacement_bucket->reserved_clients--;
-			if (replacement_bucket->reserved_clients == 0) {
-				result.bucket_node = ExtractBucketLocked(*replacement_bucket);
-			}
-		}
-		if (exact != client_buckets.end()) {
-			exact->second.reserved_clients++;
-			result.bucket = exact->second;
-		}
-		HTTPTransportCapacityGuard::MarkCurrentCapacityOwned(*this);
-		return result;
-	}
-}
-
-void HTTPTransportManager::PrepareBucket(Reservation &reservation, const string &origin) {
-	if (!reservation.cacheable || reservation.bucket) {
-		return;
-	}
-	if (reservation.bucket_node) {
-		auto &bucket = reservation.bucket_node.mapped();
-		D_ASSERT(bucket.reserved_clients == 0);
-		D_ASSERT(bucket.idle_clients.empty());
-		D_ASSERT(!bucket.non_empty_index.IsValid());
-		D_ASSERT(bucket.idle_clients.capacity() >= reservation.bucket_capacity);
-		reservation.bucket_node.key() = reservation.key;
-		bucket.key = reservation.key;
-		bucket.origin = origin;
-		bucket.reserved_clients = 1;
-	} else {
-		ClientBucket bucket;
-		bucket.key = reservation.key;
-		bucket.origin = origin;
-		bucket.idle_clients.reserve(reservation.bucket_capacity);
-		bucket.reserved_clients = 1;
-		ClientBucketMap pending;
-		pending.emplace(reservation.key, std::move(bucket));
-		reservation.bucket_node = pending.extract(pending.begin());
-	}
-
-	annotated_lock_guard<annotated_mutex> guard(lock);
-	auto exact = FindBucketLocked(reservation.key, origin);
-	if (exact != client_buckets.end()) {
-		exact->second.reserved_clients++;
-		reservation.bucket = exact->second;
-		return;
-	}
-	auto inserted = client_buckets.insert(std::move(reservation.bucket_node));
-	reservation.bucket = inserted->second;
+	key.connection_epoch = state.connection_epoch;
+	const bool cacheable = state.provider_epoch == current_provider_epoch && !state.reuse_poisoned &&
+	                       (state.reuse_policy == HTTPTransportReusePolicy::SESSION_LOCAL ||
+	                        state.reuse_policy == HTTPTransportReusePolicy::SHARED);
+	auto result = clients.Reserve(key, origin, cacheable);
+	HTTPTransportCapacityGuard::MarkCurrentCapacityOwned(*this);
+	return result;
 }
 
 void HTTPTransportManager::PrepareClient(Reservation &reservation, HTTPTransportManagerState &state, HTTPParams &params,
                                          const string &origin) {
-	if (reservation.kind == ReservationKind::REUSE && reservation.client) {
+	if (reservation.kind == HTTPClientPool::ReservationKind::REUSE && reservation.client) {
 		if (reservation.client->CanReuse(params)) {
 			reservation.client->Initialize(params);
 			return;
@@ -577,6 +413,7 @@ HTTPTransportManager::Lease HTTPTransportManager::Acquire(Session &session, HTTP
 	key.provider_epoch = state.provider_epoch;
 	key.session_id =
 	    state.reuse_policy == HTTPTransportReusePolicy::SESSION_LOCAL ? session.session_id : DConstants::INVALID_INDEX;
+	key.reuse_domain = params.GetTransportReuseDomain();
 	key.origin_hash = std::hash<string> {}(origin);
 
 	Reservation reservation;
@@ -585,7 +422,10 @@ HTTPTransportManager::Lease HTTPTransportManager::Acquire(Session &session, HTTP
 		reservation = ReserveClientLocked(state, key, origin, guard);
 	}
 	try {
-		PrepareBucket(reservation, origin);
+		if (reservation.PrepareBucket(origin)) {
+			annotated_lock_guard<annotated_mutex> guard(lock);
+			clients.AdoptPreparedBucket(reservation, origin);
+		}
 		PrepareClient(reservation, state, params, origin);
 	} catch (...) {
 		DropReservation(std::move(reservation.client), reservation.bucket);
@@ -626,12 +466,12 @@ unique_ptr<HTTPResponse> HTTPTransportManager::PerformRequest(Session &session, 
 }
 
 bool HTTPTransportManager::CanReturnClientLocked(const Lease &lease, bool cleanup_succeeded) const {
-	if (!cleanup_succeeded || !lease.reusable || !lease.client || closed || !lease.state || !lease.bucket ||
-	    !IsStateValidLocked(*lease.state)) {
+	if (!cleanup_succeeded || !lease.reusable || !lease.client || clients.IsClosed() || !lease.state ||
+	    !lease.bucket.IsValid() || !IsStateValidLocked(*lease.state)) {
 		return false;
 	}
 	auto &state = *lease.state;
-	auto &key = lease.bucket->key;
+	auto &key = lease.bucket.GetKey();
 	return !state.reuse_poisoned && state.provider_epoch == current_provider_epoch &&
 	       state.connection_epoch == key.connection_epoch &&
 	       (state.reuse_policy == HTTPTransportReusePolicy::SESSION_LOCAL ||
@@ -651,23 +491,12 @@ void HTTPTransportManager::Release(Lease &lease) noexcept {
 	}
 
 	bool returned = false;
-	bool notify_waiter = false;
 	{
 		annotated_lock_guard<annotated_mutex> guard(lock);
 		if (CanReturnClientLocked(lease, cleanup_succeeded)) {
-			auto &bucket = *lease.bucket;
-			D_ASSERT(bucket.idle_clients.size() < bucket.idle_clients.capacity());
-			const bool was_empty = bucket.idle_clients.empty();
-			bucket.idle_clients.push_back(std::move(lease.client));
-			if (was_empty) {
-				AddNonEmptyBucketLocked(bucket);
-			}
+			clients.Return(lease.bucket, std::move(lease.client));
 			returned = true;
-			notify_waiter = waiting_threads > 0;
 		}
-	}
-	if (notify_waiter) {
-		availability.notify_one();
 	}
 	if (returned) {
 		return;
@@ -676,63 +505,28 @@ void HTTPTransportManager::Release(Lease &lease) noexcept {
 	DropReservation(std::move(lease.client), lease.bucket);
 }
 
-void HTTPTransportManager::DropReservation(unique_ptr<HTTPClient> client, optional_ptr<ClientBucket> bucket) noexcept {
-	ClientBucketMap::node_type bucket_node;
+void HTTPTransportManager::DropReservation(unique_ptr<HTTPClient> client, BucketHandle bucket) noexcept {
+	HTTPClientPool::DetachedBucket bucket_node;
 	client.reset();
-	bool notify_waiter;
 	{
 		annotated_lock_guard<annotated_mutex> guard(lock);
-		D_ASSERT(reserved_clients > 0);
-		reserved_clients--;
-		if (bucket) {
-			D_ASSERT(bucket->reserved_clients > 0);
-			bucket->reserved_clients--;
-			if (bucket->reserved_clients == 0) {
-				bucket_node = ExtractBucketLocked(*bucket);
-			}
-		}
-		notify_waiter = waiting_threads > 0;
+		bucket_node = clients.FinishDestruction(bucket);
 	}
-	if (notify_waiter) {
-		availability.notify_one();
-	}
-}
-
-bool HTTPTransportManager::MatchesFilter(const ClientKey &key, IdleFilter filter, idx_t first, uint64_t second) const {
-	switch (filter) {
-	case IdleFilter::PROVIDER:
-		return key.provider_epoch == first;
-	case IdleFilter::CONNECTION:
-		return key.provider_epoch == first && key.connection_epoch < second;
-	case IdleFilter::SESSION:
-		return key.session_id == first;
-	case IdleFilter::ALL:
-		return true;
-	}
-	return false;
 }
 
 void HTTPTransportManager::DisposeIdle(IdleFilter filter, idx_t first, uint64_t second) noexcept {
 	HTTPTransportCapacityGuard capacity_guard(*this);
 	while (true) {
-		unique_ptr<HTTPClient> client;
-		optional_ptr<ClientBucket> bucket;
+		Reservation reservation;
 		{
 			annotated_lock_guard<annotated_mutex> guard(lock);
-			auto entry = client_buckets.begin();
-			for (; entry != client_buckets.end(); ++entry) {
-				if (!entry->second.idle_clients.empty() && MatchesFilter(entry->first, filter, first, second)) {
-					break;
-				}
-			}
-			if (entry == client_buckets.end()) {
+			reservation = clients.TakeIdleForDisposal(filter, first, second);
+			if (!reservation.client) {
 				return;
 			}
-			bucket = entry->second;
-			client = TakeIdleClientLocked(*bucket);
 			HTTPTransportCapacityGuard::MarkCurrentCapacityOwned(*this);
 		}
-		DropReservation(std::move(client), bucket);
+		DropReservation(std::move(reservation.client), reservation.bucket);
 	}
 }
 
@@ -768,9 +562,8 @@ void HTTPTransportManager::Invalidate(optional_ptr<HTTPTransportManagerState> st
 void HTTPTransportManager::Close() noexcept {
 	{
 		annotated_lock_guard<annotated_mutex> guard(lock);
-		closed = true;
+		clients.Close();
 	}
-	availability.notify_all();
 	DisposeIdle(IdleFilter::ALL);
 }
 

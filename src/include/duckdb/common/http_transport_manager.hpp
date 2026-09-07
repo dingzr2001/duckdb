@@ -7,11 +7,8 @@
 
 #pragma once
 
-#include "duckdb/common/condition_variable.hpp"
-#include "duckdb/common/http_util.hpp"
+#include "duckdb/common/http_client_pool.hpp"
 #include "duckdb/common/mutex.hpp"
-#include "duckdb/common/optional_idx.hpp"
-#include "duckdb/common/unordered_map.hpp"
 
 namespace duckdb {
 
@@ -68,37 +65,10 @@ public:
 	    DUCKDB_EXCLUDES(lock);
 
 private:
-	struct ClientKey {
-		bool operator==(const ClientKey &other) const;
-
-		//! Provider publication that created the parameters.
-		idx_t provider_epoch = DConstants::INVALID_INDEX;
-		//! Connection generation captured when capacity was reserved.
-		uint64_t connection_epoch = 0;
-		//! Creating session for local reuse, or INVALID_INDEX otherwise.
-		idx_t session_id = DConstants::INVALID_INDEX;
-		//! Hash of the structural scheme, host, and port identity.
-		hash_t origin_hash = 0;
-	};
-
-	struct ClientKeyHash {
-		hash_t operator()(const ClientKey &key) const;
-	};
-
-	struct ClientBucket {
-		//! Structural key duplicated for stable bucket lookup and removal.
-		ClientKey key;
-		//! Collision-checking scheme, host, and port identity.
-		string origin;
-		//! Reusable clients currently available for this exact origin.
-		vector<unique_ptr<HTTPClient>> idle_clients;
-		//! Count of creating, leased, destroying, and idle clients for this bucket.
-		idx_t reserved_clients = 0;
-		//! Position in non_empty_buckets while at least one client is idle.
-		optional_idx non_empty_index;
-	};
-
-	using ClientBucketMap = std::unordered_multimap<ClientKey, ClientBucket, ClientKeyHash>;
+	using ClientKey = HTTPClientPool::ClientKey;
+	using BucketHandle = HTTPClientPool::BucketHandle;
+	using Reservation = HTTPClientPool::Reservation;
+	using IdleFilter = HTTPClientPool::IdleFilter;
 
 	class Lease {
 	public:
@@ -111,7 +81,7 @@ private:
 	private:
 		friend class HTTPTransportManager;
 
-		Lease(HTTPTransportManager &manager, HTTPTransportManagerState &state, optional_ptr<ClientBucket> bucket,
+		Lease(HTTPTransportManager &manager, HTTPTransportManagerState &state, BucketHandle bucket,
 		      unique_ptr<HTTPClient> client);
 
 	public:
@@ -127,7 +97,7 @@ private:
 		//! Provider publication captured by the creating session.
 		optional_ptr<HTTPTransportManagerState> state;
 		//! Stable bucket accounting for this reusable reservation.
-		optional_ptr<ClientBucket> bucket;
+		BucketHandle bucket;
 		//! Client held exclusively by the synchronous request.
 		unique_ptr<HTTPClient> client;
 		//! Whether this request may return its client to the idle pool.
@@ -139,26 +109,6 @@ private:
 		optional_ptr<HTTPTransportManagerState> state;
 		//! Unique non-recycled identity reserved for the new session.
 		idx_t session_id = DConstants::INVALID_INDEX;
-	};
-
-	enum class ReservationKind : uint8_t { REUSE, NEW_CLIENT };
-	enum class IdleFilter : uint8_t { PROVIDER, CONNECTION, SESSION, ALL };
-
-	struct Reservation {
-		//! Structural key captured for this reservation.
-		ClientKey key;
-		//! Stable bucket accounting for a cacheable reservation.
-		optional_ptr<ClientBucket> bucket;
-		//! Idle client selected for reuse or replacement.
-		unique_ptr<HTTPClient> client;
-		//! Extracted or preallocated bucket node for a new exact origin.
-		ClientBucketMap::node_type bucket_node;
-		//! Work needed before the request can use the client.
-		ReservationKind kind = ReservationKind::NEW_CLIENT;
-		//! Whether this reservation may create and return through a bucket.
-		bool cacheable = false;
-		//! Capacity captured for out-of-lock bucket vector reservation.
-		idx_t bucket_capacity = 0;
 	};
 
 private:
@@ -188,54 +138,33 @@ private:
 	Lease Acquire(Session &session, HTTPParams &params, const string &origin) DUCKDB_EXCLUDES(lock);
 	Reservation ReserveClientLocked(HTTPTransportManagerState &state, ClientKey key, const string &origin,
 	                                annotated_unique_lock<annotated_mutex> &guard) DUCKDB_REQUIRES(lock);
-	void PrepareBucket(Reservation &reservation, const string &origin) DUCKDB_EXCLUDES(lock);
 	void PrepareClient(Reservation &reservation, HTTPTransportManagerState &state, HTTPParams &params,
 	                   const string &origin) DUCKDB_EXCLUDES(lock);
 	void Release(Lease &lease) noexcept DUCKDB_EXCLUDES(lock);
-	void DropReservation(unique_ptr<HTTPClient> client, optional_ptr<ClientBucket> bucket = nullptr) noexcept
-	    DUCKDB_EXCLUDES(lock);
+	void DropReservation(unique_ptr<HTTPClient> client, BucketHandle bucket) noexcept DUCKDB_EXCLUDES(lock);
 
 	//! Lock-held state helpers.
 	void ValidateStateLocked(const HTTPTransportManagerState &state) const DUCKDB_REQUIRES(lock);
 	bool IsStateValidLocked(const HTTPTransportManagerState &state) const DUCKDB_REQUIRES(lock);
-	void WaitForAdmissionLocked(annotated_unique_lock<annotated_mutex> &guard) DUCKDB_REQUIRES(lock);
 	bool CanReturnClientLocked(const Lease &lease, bool cleanup_succeeded) const DUCKDB_REQUIRES(lock);
-	ClientBucketMap::iterator FindBucketLocked(const ClientKey &key, const string &origin) DUCKDB_REQUIRES(lock);
-	ClientBucketMap::node_type ExtractBucketLocked(ClientBucket &bucket) DUCKDB_REQUIRES(lock);
-	unique_ptr<HTTPClient> TakeIdleClientLocked(ClientBucket &bucket) DUCKDB_REQUIRES(lock);
-	void AddNonEmptyBucketLocked(ClientBucket &bucket) DUCKDB_REQUIRES(lock);
-	void RemoveNonEmptyBucketLocked(ClientBucket &bucket) DUCKDB_REQUIRES(lock);
 
 	//! Idle disposal helpers.
 	void DisposeIdle(IdleFilter filter, idx_t first = DConstants::INVALID_INDEX, uint64_t second = 0) noexcept
 	    DUCKDB_EXCLUDES(lock);
-	bool MatchesFilter(const ClientKey &key, IdleFilter filter, idx_t first, uint64_t second) const;
 
 private:
 	//! Protects all mutable manager state below.
 	mutable annotated_mutex lock;
-	//! Wakes waiters when capacity, an idle client, or shutdown becomes available.
-	condition_variable availability;
 	//! Retained provider publications indexed by provider epoch.
 	vector<unique_ptr<HTTPTransportManagerState>> providers DUCKDB_GUARDED_BY(lock);
-	//! Reusable client buckets grouped by fixed structural hashes.
-	ClientBucketMap client_buckets DUCKDB_GUARDED_BY(lock);
-	//! Buckets containing at least one idle client for O(1) eviction.
-	vector<optional_ptr<ClientBucket>> non_empty_buckets DUCKDB_GUARDED_BY(lock);
+	//! Client storage, admission and reservation accounting under the manager lock.
+	HTTPClientPool clients DUCKDB_GUARDED_BY(lock);
 	//! Provider epoch selected for new sessions.
 	idx_t current_provider_epoch DUCKDB_GUARDED_BY(lock) = 0;
 	//! Next non-recycled manager session identity.
 	idx_t next_session_id DUCKDB_GUARDED_BY(lock) = 1;
-	//! Configured maximum number of counted clients and reservations.
-	idx_t capacity DUCKDB_GUARDED_BY(lock) = 0;
-	//! Count of creating, leased, destroying, and idle clients.
-	idx_t reserved_clients DUCKDB_GUARDED_BY(lock) = 0;
-	//! Number of threads currently waiting for capacity or an idle client.
-	idx_t waiting_threads DUCKDB_GUARDED_BY(lock) = 0;
 	//! Whether Configure installed the capacity and bucket indexes.
 	bool initialized DUCKDB_GUARDED_BY(lock) = false;
-	//! Whether database teardown permanently closed admission.
-	bool closed DUCKDB_GUARDED_BY(lock) = false;
 };
 
 } // namespace duckdb

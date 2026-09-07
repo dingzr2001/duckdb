@@ -56,6 +56,7 @@ struct HTTPParams {
 
 public:
 	void Initialize(optional_ptr<FileOpener> opener);
+	DUCKDB_API idx_t GetTransportReuseDomain() const;
 
 	template <class TARGET>
 	TARGET &Cast() {
@@ -68,6 +69,9 @@ public:
 		return reinterpret_cast<const TARGET &>(*this);
 	}
 
+protected:
+	DUCKDB_API void SetTransportReuseDomain(idx_t transport_reuse_domain);
+
 private:
 	friend class HTTPUtil;
 	friend class HTTPTransportManager;
@@ -78,6 +82,8 @@ private:
 	optional_ptr<HTTPTransportManagerState> transport_state;
 	//! Manager-issued identity used for session-local reuse.
 	idx_t transport_session_id = DConstants::INVALID_INDEX;
+	//! Provider-issued identity for transport-compatible parameters.
+	idx_t transport_reuse_domain = 0;
 };
 
 struct SignatureV4Params {

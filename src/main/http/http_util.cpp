@@ -35,6 +35,14 @@ namespace duckdb {
 HTTPParams::~HTTPParams() {
 }
 
+idx_t HTTPParams::GetTransportReuseDomain() const {
+	return transport_reuse_domain;
+}
+
+void HTTPParams::SetTransportReuseDomain(idx_t transport_reuse_domain_p) {
+	transport_reuse_domain = transport_reuse_domain_p;
+}
+
 HTTPHeaders::HTTPHeaders(DatabaseInstance &db) {
 	headers.insert({"User-Agent", StringUtil::Format("%s %s", db.config.UserAgent(), DuckDB::SourceID())});
 }
