@@ -279,8 +279,8 @@ vector<string> PEGTransformerFactory::TransformUnpivotHeaderList(PEGTransformer 
 	return IdentifiersToStrings(col_id_or_string);
 }
 
-vector<string> PEGTransformerFactory::TransformParenthesizedNameList(
-    PEGTransformer &transformer, const vector<Identifier> &col_id_or_string) {
+vector<string> PEGTransformerFactory::TransformParenthesizedNameList(PEGTransformer &transformer,
+                                                                     const vector<Identifier> &col_id_or_string) {
 	return IdentifiersToStrings(col_id_or_string);
 }
 
