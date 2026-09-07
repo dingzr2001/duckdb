@@ -135,6 +135,8 @@ struct ActiveGrammarExtensionsSetting {
 	static constexpr const char *Name = "active_grammar_extensions";
 	static constexpr const char *Description = "The grammar extensions used by the parser";
 	static constexpr const char *InputType = "VARCHAR[]";
+	static constexpr bool IsDebug = false;
+	static constexpr bool IsDeprecated = false;
 	static void SetLocal(ClientContext &context, const Value &parameter);
 	static void ResetLocal(ClientContext &context);
 	static bool OnLocalSet(ClientContext &context, const Value &input);
