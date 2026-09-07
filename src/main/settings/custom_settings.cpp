@@ -1554,7 +1554,7 @@ Value StandardVectorSizeSetting::GetSetting(const ClientContext &) {
 //===----------------------------------------------------------------------===//
 void MaxStreamingBufferSizeSetting::SetLocal(ClientContext &context, const Value &input) {
 	auto &config = ClientConfig::GetConfig(context);
-	config.streaming_buffer_size = DBConfig::ParseMemoryLimit(input.ToString());
+	config.max_streaming_buffer_size = DBConfig::ParseMemoryLimit(input.ToString());
 }
 
 void MaxStreamingBufferSizeSetting::ResetLocal(ClientContext &context) {
@@ -1564,7 +1564,7 @@ void MaxStreamingBufferSizeSetting::ResetLocal(ClientContext &context) {
 
 Value MaxStreamingBufferSizeSetting::GetSetting(const ClientContext &context) {
 	auto &config = ClientConfig::GetConfig(context);
-	return Value(StringUtil::BytesToHumanReadableString(config.streaming_buffer_size));
+	return Value(StringUtil::BytesToHumanReadableString(config.max_streaming_buffer_size));
 }
 
 //===----------------------------------------------------------------------===//
